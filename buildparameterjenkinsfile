@@ -1,0 +1,132 @@
+pipeline {
+    agent any
+     environment {
+        REGION = 'ap-south-1'
+        BUILD_TAG = "prod_v_${env.BUILD_NUMBER}"
+        ENVIRONMENT = 'production'
+       
+    }
+    stages {
+          stage('Checkout Service Code') {
+            steps {
+                git branch: 'master-test', credentialsId: 'mounika_bethu', url: '...'
+            }
+        }
+        
+        
+        stage('Terraform Apply') {
+            steps {
+                script {
+                    // Start of the script block
+                   
+                        // Inside this block, set environment variables and execute Terraform commands
+                        withEnv(["TF_VAR_desired_count=${params.desired_count}", "TF_VAR_cpu=${params.cpu}", "TF_VAR_memory=${params.memory}"]){                    // Execute Terraform commands
+                            sh 'terraform init'
+                            sh 'terraform apply -auto-approve'
+                            REPO_URI = sh(script: 'terraform output -json repoUri | jq -r .[0]', returnStdout: true).trim()
+                            TARGET_GROUP_ARN = sh(script: 'terraform output -json targetGroupArn | jq -r .[0]', returnStdout: true).trim()
+                        
+                        // Print the Terraform outputs
+                            echo "REPO_URI: ${REPO_URI}"
+                            echo "TARGET_GROUP_ARN: ${TARGET_GROUP_ARN}"
+                        
+                        // Pass the REPO_URI value to the next stages
+                            env.REPO_URI = REPO_URI
+                        }
+                    }
+            }
+        }
+            
+        stage('Build Image') {
+            steps {
+                script {
+                    echo "Desired Count: ${params.desired_count}"
+
+                    // Define other variables
+                    def buildTag = env.BUILD_TAG
+                    def repoName = env.REPO_NAME
+                    def region = env.REGION
+                    def repoUri = env.REPO_URI
+                    
+                    // Print the repository URI
+                    echo "Using REPO_URI: ${repoUri}"
+                    
+                    // Generate Dockerfile with environment variables
+                    sh "sed -e 's;%env%;${ENVIRONMENT};g;' Dockerfile > Dockerfile-${buildTag}"
+                    
+                    // Build Docker image
+                    sh "docker build -t ${repoName}:${buildTag} -f Dockerfile-${buildTag} --pull=true $WORKSPACE"
+                    
+                    // Tag Docker image with repository URI
+                    sh "docker tag ${repoName}:${buildTag} ${repoUri}:${buildTag}"
+                    
+                    // Login to ECR
+                    sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${repoUri}"
+                    
+                    // Push Docker image to ECR
+                    sh "docker push ${repoUri}:${buildTag}"
+                }
+            }
+        }
+        
+       stage('ECS Deploy') {
+            steps {
+                script {
+                    // Fetch Task Definition ARN
+                    def taskDefArn = sh(script: 'terraform output task_definition_arn', returnStdout: true).trim()
+                    echo "Task Definition ARN: ${taskDefArn}"
+                    def familyName = sh(script: 'terraform output task_definition_family', returnStdout: true).trim()
+                    echo "Task Definition Family Name: ${familyName}"
+                    def ecsClusterName = sh(script: 'terraform output ecs_cluster_name', returnStdout: true).trim()
+                    echo "ECS Cluster Name: ${ecsClusterName}"
+                    def servicename = sh(script: 'terraform output service_name', returnStdout: true).trim()
+                    echo "service name:${servicename}"
+                    // Define variables
+                    def clusterName = "${ecsClusterName}"
+                    def serviceName = "${servicename}"
+                    def region = env.REGION
+                    def taskDefFamily = familyName.replaceAll('"', '') 
+                    def taskDefinition = "${taskDefArn}"
+                    def containerName = "stg"
+                    def logGroup = "stg"
+                    def containerPort = 80
+                    def CPU = "${params.cpu}"
+                    def MEMORY = "${params.memory}"
+                    def REPO_URI = env.REPO_URI
+                    def BUILD_TAG = env.BUILD_TAG
+                    def DESIRED_COUNT = "${params.desired_count}"
+                    echo "Desired Count: ${params.desired_count}"
+
+                    
+                    
+
+                    // Replace placeholders in taskDef.json
+                   sh """
+                  sed -e 's;%BUILD_TAG%;${BUILD_TAG};g;s;%LOG_GROUP%;${logGroup};g;s;%CPU%;${CPU};g;s;%MEMORY%;${MEMORY};g;s;%REPO_URI%;${REPO_URI};g;s;%FAMILY_NAME%;${taskDefFamily};g;s;%CONTAINER_NAME%;${containerName};g;s;%CONTAINER_PORT%;${containerPort};g;' taskDeftest.json > taskDef-${BUILD_TAG}.json
+                   """
+                  // Register Task Definition
+            sh "aws ecs register-task-definition --family ${taskDefFamily} --region ${region} --cli-input-json file://taskDef-${BUILD_TAG}.json"
+
+            // Fetch Revision Number
+            def REVISION = sh(script: "aws ecs describe-task-definition --task-definition ${taskDefFamily} --region ${region} | jq -r '.taskDefinition.revision'", returnStdout: true).trim()
+            echo "Task Definition Revision: ${REVISION}"
+
+            // Check if service exists
+            def SERVICES = sh(script: "aws ecs describe-services --services ${serviceName} --cluster ${ecsClusterName} --region ${region} | jq '.failures[]'", returnStdout: true).trim()
+
+            // Create or update service based on existence
+            if (SERVICES.isEmpty()) {
+                echo "Updating the service"
+                sh "aws ecs update-service --cluster ${ecsClusterName} --region ${region} --service ${serviceName} --task-definition ${taskDefFamily}:${REVISION} --desired-count ${DESIRED_COUNT} --deployment-configuration maximumPercent=200,minimumHealthyPercent=100"
+            } else {
+                echo "Creating a new Service"
+                sh "aws ecs create-service --service-name ${serviceName} --desired-count ${DESIRED_COUNT} --task-definition ${taskDefFamily} --cluster ${ecsClusterName} --region ${region}  --load-balancers targetGroupArn=${targetGroupArn},containerName=${containerName},containerPort=${containerPort}"
+            }
+                }
+            }
+       }   
+    }
+ }
+   
+    
+
